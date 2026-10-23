@@ -1,0 +1,5 @@
+numpy
+pandas
+pyarrow
+joblib
+torch>=2.1
