@@ -24,7 +24,7 @@ Feature taxonomy
     • procedures  : PROCEDURE//START// codes
 
   Context (static demographics):
-    • columns: insurance, language, marital_status, race
+    • race (admission column), sex (GENDER// events)
     • age computed from MEDS_BIRTH vs first admission time
 
 All statistics (mean, std) are computed from the training split only.
@@ -134,7 +134,7 @@ class FeatureManifest:
     # Optional: human-readable descriptions from codes.parquet
     code_descriptions: Dict[str, str]
 
-    # Sex encoded separately from GENDER// events (default None for back-compat)
+    # Sex encoded separately from GENDER// events
     sex_categories: List[str] = None   # e.g. ['F', 'M']
 
     # ── Derived dimensions ──────────────────────────────────────────────────
@@ -210,7 +210,7 @@ class FeatureManifest:
     @classmethod
     def load(cls, path: Path) -> "FeatureManifest":
         data = json.loads(Path(path).read_text())
-        # Back-compat: fill in fields added after initial release
+        # sex_categories is optional in saved manifests
         data.setdefault("sex_categories", [])
         return cls(**data)
 

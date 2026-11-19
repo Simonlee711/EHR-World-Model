@@ -26,7 +26,7 @@ Subgroup stratification keys
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -177,26 +177,3 @@ def extract_patient_labels(df: pd.DataFrame, id_col: str = "patient_id") -> pd.D
         {d: int(labels[f"has_{d}"].sum()) for d in list(DISEASE_PREFIXES)[:6]},
     )
     return labels.reset_index()
-
-
-# ---------------------------------------------------------------------------
-# Attach labels to patient transitions
-# ---------------------------------------------------------------------------
-
-def attach_labels_to_transitions(
-    transitions: list,
-    labels_df: pd.DataFrame,
-    id_col: str = "patient_id",
-) -> list:
-    """
-    Add disease labels to each transition dict.
-    Transitions must have a 'patient_id' field.
-    """
-    label_map = labels_df.set_index(id_col).to_dict(orient="index")
-    enriched = []
-    for t in transitions:
-        pid = t.get("patient_id")
-        if pid is not None and pid in label_map:
-            t = {**t, **label_map[pid]}
-        enriched.append(t)
-    return enriched

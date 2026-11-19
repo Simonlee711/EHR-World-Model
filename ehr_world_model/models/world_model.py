@@ -1,5 +1,5 @@
 """
-Velocity-Matrix World Model (v6) — discrete Neural-CDE-style latent dynamics.
+EHRWorldModel: action-conditioned latent dynamics with a state- and action-dependent velocity operator.
 
     z_t      = projector(s_t)                         (MLP encoder)
     F_t      = predictor([z_t ; a_t])  ∈ R^{D×D}       (spectral-normed MLP)
@@ -10,9 +10,8 @@ Loss = λ_mse·MSE(z_pred, z_tgt) + λ_path·MSE(dz_pred, dz_tgt)
      + λ_sigreg·SIGReg(emb, preds) + λ_recon·masked-MSE(recon_head(emb), s_cont)
 
 Targets are stop-gradient encoder outputs; SIGReg and the reconstruction head
-train the projector. ``action_conditioned=False`` gives the no-action ablation
-(Model B). ``_step`` is the single-step transition used by rollout and the
-counterfactual / MPC experiments.
+train the projector. ``action_conditioned=False`` gives the no-action ablation.
+``_step`` is the single-step transition used for rollouts (see experiments.evaluate.rollout).
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ import torch.nn as nn
 from ..sigreg import sigreg_loss_fourier
 
 
-class VelocityWorldModel(nn.Module):
+class EHRWorldModel(nn.Module):
     def __init__(self, state_dim, n_actions, latent_dim=128,
                  action_conditioned=True,
                  lambda_mse=1.0, lambda_path=0.5, lambda_sigreg=0.05,
@@ -40,8 +39,7 @@ class VelocityWorldModel(nn.Module):
 
         pred_in = D + (n_actions if action_conditioned else 0)
 
-        # Use LayerNorm instead of BatchNorm: works correctly regardless of
-        # batch size, sequence length, or eval/train mode transitions
+        # LayerNorm: normalisation independent of batch size, sequence length and train/eval mode
         self.projector = nn.Sequential(
             nn.Linear(state_dim, 256), nn.LayerNorm(256),
             nn.ReLU(), nn.Dropout(0.4), nn.Linear(256, D),
@@ -166,17 +164,3 @@ class VelocityWorldModel(nn.Module):
                     sigreg_pred_loss=loss_path.detach(),
                     recon_loss=recon_loss.detach(),
                     emb=emb.detach(), next_emb=next_emb)
-
-    @torch.no_grad()
-    def rollout(self, s0, actions, n_steps):
-        self.eval()
-        B = s0.shape[0]
-        z  = self.projector(s0)
-        dz = torch.zeros_like(z)
-        out = []
-        for t in range(n_steps):
-            a = (actions[:, t, :] if t < actions.shape[1]
-                 else torch.zeros(B, self.n_actions, device=s0.device))
-            z, dz = self._step(z, dz, a)
-            out.append(z)
-        return torch.stack(out, dim=1)

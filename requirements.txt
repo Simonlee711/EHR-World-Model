@@ -1,5 +1,8 @@
 numpy
 pandas
 pyarrow
-joblib
 torch>=2.1
+scikit-learn
+scipy
+lifelines
+xgboost

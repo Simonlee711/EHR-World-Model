@@ -1,30 +1,46 @@
 # EHR World Model
 
-An action-conditioned latent world model for ICU/hospital EHR trajectories
-(MIMIC-IV in [MEDS](https://github.com/Medical-Event-Data-Standard/meds) format).
-Patient state is binned into 6-hour steps. Clinician actions (medication starts)
-condition the latent dynamics. The trained model is used for multi-step rollout
-and for counterfactual treatment simulation.
+<p align="center">
+  <a href="assets/hero.pdf"><img src="assets/hero.png" alt="EHR-WM overview: (1) states and actions in 6-hour windows, (2) latent dynamics z_{t+1} = z_t + F(z_t, a_t)Δz_t + B(z_t, a_t), (3) action-conditioned rollout" width="100%"></a>
+</p>
+
+EHR-WM is an action-conditioned latent world model for ICU and hospital EHR trajectories.
+Patient state (vitals, labs, demographics) is binned into 6-hour windows. Five classes of
+clinical action (antibiotics, IV fluids, vasopressors, analgesics, sedatives) enter the latent
+transition operator directly:
+
+    z_{t+1} = z_t + F(z_t, a_t) Δz_t + B(z_t, a_t),    B(z, 0) = 0
+
+The model is trained separately on MIMIC-IV, eICU-CRD and NWICU. It is evaluated on latent
+trajectory fidelity, forecasting of clinical measurements, downstream classification and
+time-to-event prediction, and matched-cohort intervention analyses.
 
 ## Layout
 
 ```
-ehr_world_model/
-  config.py, features.py   feature selection (vitals / labs = state, meds = actions)
-  data.py                  MEDS → binned enriched transitions → sliding-window sequences
-  labels.py                ICD-prefix disease flags
-  cohort.py                end-to-end data pipeline: fast MEDS loader, demographics,
-                           outcome + EHRSHOT-style temporal labels, cached transitions,
-                           DemoAugLoader, build_cohort()
-  sigreg.py                Fourier Epps-Pulley SIGReg regulariser
-  models/velocity.py       VelocityWorldModel  (z_{t+1} = z_t + F(z_t, a_t)·dz_t)
-  models/transformer.py    TransformerWorldModel (bidirectional encoder + causal predictor, S/M/L)
-  training.py              scheduled-sampling curriculum (tf 1.0/k1 → 0.5/k2 → 0.5/k4)
-  inference.py             build/save/load checkpoints, patient trajectories, risk probes
-  rollout.py               multi-step autoregressive rollout evaluation
-  counterfactual.py        free-running counterfactuals, drug screening, greedy + shooting MPC
-preprocessing/             standalone single-file MEDS preprocessing (no package imports)
-scripts/                   train.py, rollout.py, counterfactual.py
+ehr_world_model/            core model and MEDS utilities
+  models/world_model.py     EHRWorldModel: encoder, velocity operator F(z, a), SIGReg + reconstruction losses
+  sigreg.py                 Fourier Epps-Pulley SIGReg regulariser
+  inference.py              model construction, checkpoint save / load
+  features.py, config.py    MEDS code classification and the 78-code medication manifest
+  labels.py, cohort.py      MEDS loader, demographics, disease flags and in-hospital outcome labels
+experiments/                data preprocessing, training and every experiment
+  actions.py                5 clinical action groups (drug-name lexicon, ICU fluid itemids, ATC rules)
+  features.py               42 curated state concepts (itemid merges, plausibility ranges, log transforms)
+  data.py                   MIMIC-IV MEDS -> processed 6-h timelines (Split, WindowDataset)
+  xsite.py                  the same features / actions for harmonised MIMIC-IV, eICU-CRD and NWICU extracts
+  models.py                 AdditiveActionEHRWorldModel: adds the action forcing term B(z, a)
+  train.py                  model specs, scheduled-sampling curriculum, checkpoints
+  evaluate.py               encoding, free rollout, downstream probe benchmark
+  run_site.py               per-(site, model) driver: benchmark, discriminators, risk trajectories, RCT
+  forecast_h.py             feature-space forecasting at 6-48 h horizons vs baselines
+  forecast_models.py        GRU-D, Latent ODE and Transformer forecasting baselines
+  inpatient.py              48-h inpatient classification and time-to-event tasks
+  baselines_surv.py         CoxPH, DeepSurv and DeepHit baselines
+  xgb_baselines.py          XGBoost baselines
+  rct.py                    emulated-RCT evaluation of action conditioning
+  action_analysis.py        action specificity and physiological validation
+  traj_ablation.py          direct vs trajectory-based prediction
 ```
 
 ## Setup
@@ -33,71 +49,93 @@ scripts/                   train.py, rollout.py, counterfactual.py
 pip install -r requirements.txt
 ```
 
-Data: a MEDS extract of MIMIC-IV with `data/{train,tuning,held_out}/*.parquet`
-(and optionally `metadata/patient_splits.parquet`, `extract_code_metadata/codes.parquet`).
-MIMIC-IV requires PhysioNet credentialed access. Do not commit data or derived outputs.
+The data is not included. MIMIC-IV, eICU-CRD and NWICU require PhysioNet credentialed access.
+Run every command from the repository root, with the data in this layout:
+
+```
+data/meds/MIMIC_MEDS_Extract_v0.0.3_test/   MIMIC-IV MEDS extract (data/{train,tuning,held_out}/*.parquet,
+                                            metadata/, extract_code_metadata/codes.parquet)
+data/{mimic,eicu,nwicu}/                    harmonised MEDS-like extracts: data/, metadata/, labels/
+                                            (codes VITAL//<concept>, LAB//<concept>, MED//ATC4//<class>)
+```
 
 ## Usage
 
+**Preprocessing**
+
 ```bash
-# 1. Train (velocity model, action-conditioned)
-python scripts/train.py --data-dir MIMIC_MEDS_Extract_v0.0.3_test --out-dir runs/velocity
-
-#    transformer variant / no-action ablation
-python scripts/train.py --data-dir ... --out-dir runs/tf_M --arch transformer --size M
-python scripts/train.py --data-dir ... --out-dir runs/velocity_noact --no-action
-
-# 2. Multi-step rollout MSE (up to 24 × 6h steps)
-python scripts/rollout.py --data-dir ... --run-dir runs/velocity
-
-# 3. Counterfactuals (velocity model only)
-python scripts/counterfactual.py --data-dir ... --run-dir runs/velocity --experiment screen       --task has_Sepsis
-python scripts/counterfactual.py --data-dir ... --run-dir runs/velocity --experiment greedy-mpc   --task has_Sepsis
-python scripts/counterfactual.py --data-dir ... --run-dir runs/velocity --experiment shooting-mpc --task readmit_30d
+python -m experiments.data       # MIMIC-IV MEDS -> data/processed/mimic_wm
+python -m experiments.xsite      # MIMIC-IV / eICU-CRD / NWICU -> data/processed/xsite/<site>
 ```
 
-Each run directory gets `model.pt` (weights + constructor config),
-`feature_manifest.json`, `train_history.csv`, and CSVs from rollout and counterfactual runs.
-Transitions are cached as `transitions_<split>_<hash>.pkl`.
+**Training** (EHR-WM is `wm5plus`; checkpoints go to `runs/<site>/<model>/model.pt`)
 
-Or from Python:
-
-```python
-from ehr_world_model import build_cohort, build_model, train_curriculum, get_device
-
-device = get_device()
-cohort = build_cohort("MIMIC_MEDS_Extract_v0.0.3_test", "runs/velocity", device)
-model = build_model("velocity", cohort["state_dim"], cohort["manifest"].n_actions,
-                    cohort["n_cont"]).to(device)
-train_curriculum(model, cohort["loaders"]["train"], cohort["loaders"]["val"])
+```bash
+python -m experiments.train --proc-dir data/processed/mimic_wm   --run-dir runs/mimic --models wm5plus --stages onestep --max-train-windows 45000
+python -m experiments.train --proc-dir data/processed/xsite/eicu  --run-dir runs/eicu  --models wm5plus --stages onestep --max-train-windows 45000
+python -m experiments.train --proc-dir data/processed/xsite/nwicu --run-dir runs/nwicu --models wm5plus --stages onestep --max-train-windows 45000
 ```
 
-## Method notes
+Model names:
+- `wm5plus`: 5 action groups with the additive forcing term B(z, a). This is EHR-WM.
+- `wm5`: 5 action groups, without B.
+- `wm78`: 78 individual medication codes.
+- `wm0`: no actions (ablation).
 
-**State.** Each 6h bin has `[values | obs-mask | time-since-last-obs | carry-forward] × n_cont` features,
-plus a static demographics vector appended by `DemoAugLoader`. The default config keeps the
-top 30 vitals, 50 labs and 100 medications, each present in ≥5% of training patients.
+Suffixes select variants. `_s<seed>` sets the random seed and `_f<scale>` sets a fixed
+multiplier on B, e.g. `wm5plus_s1` or `wm5plus_f0.5`. `--stages fast` trains the full
+3-stage curriculum instead of one-step training.
 
-**Training loss.** Latent MSE + path (velocity) MSE against stop-gradient encoder targets.
-Fourier SIGReg on the embeddings and predictions prevents collapse, and a masked
-reconstruction head keeps feature-level information in the latent.
+**Evaluation** (results go to `outputs/`)
 
-**Rollout.** Each patient's windows are merged into one timeline. The model encodes step 0 and
-rolls out autoregressively under the observed actions. MSE against the encoder embedding is
-reported per horizon.
+```bash
+python -m experiments.run_site --site mimic --model wm5plus         # benchmark, discriminators, risk trajectories, RCT
+python -m experiments.forecast_h --site mimic                        # forecasting vs baselines
+python -m experiments.inpatient --site mimic_meds --models wm5plus   # inpatient classification / time-to-event
+python -m experiments.baselines_surv --site mimic_meds               # CoxPH / DeepSurv / DeepHit
+python -m experiments.baselines_surv --site mimic_meds --bench       # cache MIMIC benchmark features for XGBoost
+python -m experiments.xgb_baselines                                  # XGBoost
+python -m experiments.action_analysis --site mimic --model wm5plus   # action specificity
+python -m experiments.traj_ablation                                  # direct vs trajectory-based prediction
+```
 
-**Counterfactuals.** These are free-running: each arm is seeded with the first `--context`
-observed encoder states (default 2, so the initial velocity is real), then rolled out
-autoregressively on the model's own predictions under the arm's actions. All arms of a
-patient share the same seed. Risk comes from a
-linear per-timestep probe trained on train-split encoder trajectories, using EHRSHOT-style
-labels anchored at first admission.
-- `screen`: one-hot single-drug interventions vs. no treatment, ranked by |Δ mean risk|.
-- `greedy-mpc`: at each step, pick the best of N candidate action vectors to minimise
-  (MPC-Treat) or maximise (MPC-Withhold) next-step risk.
-- `shooting-mpc`: random-shooting MPC with H-step lookahead and a receding horizon.
+Replace `mimic` / `mimic_meds` with `eicu` or `nwicu` for the other sites. `xgb_baselines`
+runs in its own process because xgboost and torch ship conflicting OpenMP runtimes on macOS.
 
-These are model-based simulations, not causal effect estimates.
+## Method
+
+**State and actions.** Each 6-hour bin holds `[value | obs-mask | time-since-obs | decayed carry-forward]`
+for 42 curated vitals and labs, plus age and sex. Actions are binary indicators of the 5 drug
+groups starting in the bin, defined by WHO-ATC rules shared across sites.
+
+**Training.** An MLP encoder maps each state to z_t. The predictor outputs a state- and
+action-dependent operator F(z_t, a_t) applied to the latent velocity Δz_t, plus the additive
+action term B(z_t, a_t). The loss combines:
+- latent MSE and path (velocity) MSE against stop-gradient encoder targets
+- Fourier SIGReg on embeddings and predictions, to prevent collapse
+- a masked reconstruction head that keeps feature-level information in the latent
+
+**Free rollout.** All world-model predictions are free rollouts. A trajectory is seeded with two
+observed encoder states (z_{t-1}, z_t) and then rolled forward on the model's own predictions
+under the given actions, without seeing the true state again. "Oracle" rows apply the encoder
+to the real data and serve as a reference, not a prediction.
+
+**Emulated RCT** (`rct.py`). For each action group, treated and never-treated held-out admissions
+are matched within co-treatment strata (propensity score, caliper 0.2) on 0–24 h covariates.
+Four free-rollout arms run from bins 2–3 to the 54–60 h read-out:
+- treated, observed actions
+- control, observed actions
+- control with the drug applied
+- treated with the drug withheld
+
+The read-outs are:
+- energy-distance gap closed
+- direction cosine against the observed treated–control difference
+- outcome-probe risk
+- decoded per-variable effects
+- a 5×5 action-specificity matrix
+
+Matching removes measured confounding only, so these are model-based contrasts, not causal effect estimates.
 
 ## Citation
 

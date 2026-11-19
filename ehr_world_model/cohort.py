@@ -1,39 +1,23 @@
 """
-Cohort assembly for the EHR World Model.
+MEDS loading, demographics and patient-level labels for MIMIC-IV.
 
-End-to-end data pipeline on top of the MEDS loaders in ``data.py``:
-
-    MEDS parquet ─► load_meds_fast ─► demographics + labels
-                 ─► feature manifest ─► enriched transitions (cached)
-                 ─► sliding-window sequences ─► DemoAugLoader (state ⊕ demo)
-
-Label families
---------------
-* ``extract_patient_labels`` (labels.py)  : ever-diagnosed disease flags
-* ``extract_outcome_labels``              : in-hospital outcomes (LOS, ICU, readmission, mortality)
-* ``extract_ehrshot_labels``              : EHRSHOT-style temporal labels anchored at first
-                                            admission (incident disease within 365d, long LOS,
-                                            ICU transfer, 30-day readmission). Used by the
-                                            counterfactual experiments.
+* ``load_meds_fast``         column-pruned MEDS loader with patient-id filter pushdown
+* ``compute_demographics``   age at first admission, sex, BMI
+* ``extract_outcome_labels`` in-hospital outcomes (LOS, ICU admission, readmission, mortality)
+* ``build_label_table``      disease flags (labels.DISEASE_PREFIXES + NEW_DISEASE_DEF) + outcomes
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
-import joblib
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-import torch
-from torch.utils.data import DataLoader
 
 from .config import FeatureConfig
-from .data import EnrichedSequenceDataset, build_enriched_sequence_batches, build_enriched_transitions
-from .features import build_feature_manifest
-from .labels import DISEASE_PREFIXES, attach_labels_to_transitions, extract_disease_flags, extract_patient_labels
+from .labels import extract_disease_flags, extract_patient_labels
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +35,9 @@ NEW_DISEASE_DEF = {
 }
 
 OUTCOME_COLS = ["in_hospital_mortality", "icu_admission", "los_long", "readmit_30d", "readmit_any"]
-EHRSHOT_OUTCOME_COLS = ["long_los", "icu_transfer", "readmit_30d"]
 
 _ICU_PATTERN = r"ICU|INTENSIVE_CARE|CRITICAL_CARE|MICU|SICU|CVICU|NICU|CCU|TRANSFER.*ICU"
 
-
-# ── Fast MEDS loader ──────────────────────────────────────────────────────────
-# Column pruning + pyarrow filter pushdown: ~6x faster, ~5x less memory than
-# data.load_meds_cohort.
 
 def _sample_pids(data_dir, split, n, seed=42):
     """Sample up to n patient_ids from metadata/patient_splits.parquet."""
@@ -102,8 +81,6 @@ def load_meds_fast(data_dir, split, max_patients=None, seed=42) -> pd.DataFrame:
     return df
 
 
-# ── Demographics ──────────────────────────────────────────────────────────────
-
 def compute_demographics(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
     """Per-patient age at first admission, sex, BMI and binned groups."""
     birth_map = df[df["code"] == "MEDS_BIRTH"].groupby(id_col)["time"].min()
@@ -130,8 +107,6 @@ def compute_demographics(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
                                labels=["Underweight", "Normal", "Overweight", "Obese"]).astype(str)
     return demo
 
-
-# ── Outcome labels ────────────────────────────────────────────────────────────
 
 def extract_outcome_labels(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
     """In-hospital outcomes per patient: LOS, readmission, ICU admission, mortality."""
@@ -161,7 +136,8 @@ def extract_outcome_labels(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
     adm_cnt          = adm.groupby(id_col)["time"].count().rename("n_adm")
     readmit_any_pids = adm_cnt[adm_cnt >= 2].index
     first_dis_ser    = dis.groupby(id_col)["time"].min().rename("first_dis")
-    second_adm_ser   = adm.groupby(id_col)["time"].nth(1).rename("second_adm")
+    # 2nd admission per patient (adm is sorted by time)
+    second_adm_ser   = adm[adm.groupby(id_col).cumcount() == 1].set_index(id_col)["time"].rename("second_adm")
     readmit_df = pd.concat([first_dis_ser, second_adm_ser], axis=1).dropna()
     readmit_df.index.name = id_col
     readmit_df = readmit_df[readmit_df.index.isin(readmit_any_pids)].copy()
@@ -198,198 +174,7 @@ def build_label_table(df: pd.DataFrame, id_col: str, demo: Optional[pd.DataFrame
     return combined
 
 
-def all_clf_cols():
-    return ([f"has_{d}" for d in DISEASE_PREFIXES]
-            + [f"has_{k}" for k in NEW_DISEASE_DEF]
-            + OUTCOME_COLS)
-
-
-# ── EHRSHOT-style temporal labels ─────────────────────────────────────────────
-# Prediction time t = first hospital admission per patient.
-#   Disease (incident, 365-day horizon):
-#     Positive : first ICD code in [t_admit, t_admit + 365d]
-#     Negative : no ICD code before or after t_admit
-#     Excluded : any ICD code before t_admit → NaN (prevalent case)
-#   long_los     : first discharge − first admission ≥ 7 days
-#   icu_transfer : any ICU-pattern event in [t_admit, t_discharge]
-#   readmit_30d  : any new admission in (t_discharge, t_discharge + 30d]
-
-def extract_ehrshot_labels(df: pd.DataFrame, id_col: str, horizon_days: int = 365) -> pd.DataFrame:
-    adm_df = df[df["code"].str.startswith("HOSPITAL_ADMISSION//")][[id_col, "time"]].dropna()
-    dis_df = df[df["code"].str.startswith("HOSPITAL_DISCHARGE//")][[id_col, "time"]].dropna()
-
-    first_adm = adm_df.groupby(id_col)["time"].min().reset_index().rename(columns={"time": "t_admit"})
-    dis_merged = dis_df.merge(first_adm, on=id_col, how="inner")
-    first_dis = (dis_merged[dis_merged["time"] >= dis_merged["t_admit"]]
-                 .groupby(id_col)["time"].min()
-                 .reset_index().rename(columns={"time": "t_discharge"}))
-    base = first_adm.merge(first_dis, on=id_col, how="left")
-
-    # Long LOS
-    base["los_days"] = (base["t_discharge"] - base["t_admit"]).dt.total_seconds() / 86400
-    base.loc[base["los_days"] <= 0, "los_days"] = float("nan")
-    base["long_los"] = (base["los_days"] >= 7).astype(float)
-    base.loc[base["los_days"].isna(), "long_los"] = float("nan")
-
-    # ICU transfer during the admission episode
-    icu_df = df[df["code"].str.upper().str.contains(_ICU_PATTERN, na=False, regex=True)][[id_col, "time"]].dropna()
-    base_ep = base[[id_col, "t_admit", "t_discharge"]].copy()
-    base_ep["t_end"] = base_ep["t_discharge"].fillna(base_ep["t_admit"] + pd.Timedelta(days=30))
-    icu_ep = icu_df.merge(base_ep[[id_col, "t_admit", "t_end"]], on=id_col, how="inner")
-    icu_during = set(icu_ep[(icu_ep["time"] >= icu_ep["t_admit"]) & (icu_ep["time"] <= icu_ep["t_end"])][id_col])
-    base["icu_transfer"] = base[id_col].isin(icu_during).astype(int)
-
-    # 30-day readmission (anchored to first discharge)
-    adm_dis = adm_df.merge(base[[id_col, "t_discharge"]], on=id_col, how="inner").dropna(subset=["t_discharge"])
-    adm_dis["gap_days"] = (adm_dis["time"] - adm_dis["t_discharge"]).dt.total_seconds() / 86400
-    readmit_pids = set(adm_dis[(adm_dis["gap_days"] > 0) & (adm_dis["gap_days"] <= 30)][id_col])
-    base["readmit_30d"] = base[id_col].isin(readmit_pids).astype(int)
-    base.loc[base["t_discharge"].isna(), "readmit_30d"] = float("nan")
-
-    # Incident disease labels
-    diag_df = df[df["code"].str.startswith("DIAGNOSIS//ICD//")][[id_col, "code", "time"]].dropna()
-    disease_defs = {f"has_{d}": p for d, p in {**DISEASE_PREFIXES, **NEW_DISEASE_DEF}.items()}
-    horizon_td = pd.Timedelta(days=horizon_days)
-    base_adm = base[[id_col, "t_admit"]].copy()
-
-    for col_name, prefixes in disease_defs.items():
-        meds_pfx = tuple(f"DIAGNOSIS//ICD//{v}//{p}" for v, p in prefixes)
-        hits_m = (diag_df[diag_df["code"].str.startswith(meds_pfx)][[id_col, "time"]]
-                  .merge(base_adm, on=id_col, how="inner"))
-        prevalent = set(hits_m[hits_m["time"] < hits_m["t_admit"]][id_col])
-        incident  = set(hits_m[(hits_m["time"] >= hits_m["t_admit"]) &
-                               (hits_m["time"] <= hits_m["t_admit"] + horizon_td)][id_col])
-        base[col_name] = [float("nan") if pid in prevalent else (1.0 if pid in incident else 0.0)
-                          for pid in base[id_col]]
-
-    return base
-
-
-# ── Transitions (cached) ──────────────────────────────────────────────────────
-
-def _trans_cache_key(df, feat_cfg, tag, id_col):
-    pids_str = ",".join(str(p) for p in sorted(df[id_col].unique()))
-    return hashlib.md5(f"{tag}|{pids_str}|{feat_cfg}".encode()).hexdigest()[:12]
-
-
-def get_or_build_transitions(df, manifest, feat_cfg, tag, out_dir, id_col="patient_id"):
-    """build_enriched_transitions with an on-disk joblib cache.
-
-    Cache key = hash of patient IDs + FeatureConfig. Delete the .pkl files if
-    the feature extraction code changes.
-    """
-    key   = _trans_cache_key(df, feat_cfg, tag, id_col)
-    cache = Path(out_dir) / f"transitions_{tag}_{key}.pkl"
-    if cache.exists():
-        logger.info("[%s] loading transitions from cache (%s)", tag, cache.name)
-        return joblib.load(cache)
-    logger.info("[%s] building transitions", tag)
-    trans = build_enriched_transitions(df, manifest, feat_cfg)
-    joblib.dump(trans, cache)
-    return trans
-
-
-# ── Datasets & loaders ────────────────────────────────────────────────────────
-
-class LabeledSequenceDataset(EnrichedSequenceDataset):
-    """EnrichedSequenceDataset with per-window patient labels attached."""
-
-    def __init__(self, seqs, labels_df, id_col):
-        super().__init__(seqs)
-        lm = labels_df.set_index(id_col).to_dict(orient="index")
-        self._labels = [lm.get(p, {}) for p in self.patient_ids]
-
-    def label_array(self, col):
-        return np.array([float(l.get(col, float("nan"))) for l in self._labels])
-
-    def strat_array(self, col):
-        return np.array([str(l.get(col, "Unknown")) for l in self._labels])
-
-
-class DemoAugLoader:
-    """Wraps a DataLoader and concatenates the per-patient demo vector to the state
-    at every step: s_aug = [s_t ; d]  →  state_dim = 4*n_cont + demo_dim."""
-
-    def __init__(self, loader, device):
-        self._loader = loader
-        self._device = device
-
-    def __iter__(self):
-        for b in self._loader:
-            s  = b["s"].to(self._device)
-            d  = b["d"].to(self._device)
-            de = d.unsqueeze(1).expand(-1, s.shape[1], -1)
-            yield {"s": torch.cat([s, de], dim=-1),
-                   "actions": b["actions"].to(self._device),
-                   "patient_ids": b.get("patient_ids", [])}
-
-    def __len__(self):
-        return len(self._loader)
-
-
-# ── One-call pipeline ─────────────────────────────────────────────────────────
-
 def default_feature_config() -> FeatureConfig:
-    """Feature config used for the reported v6/v7 models."""
+    """Feature selection used to define the 78-code medication action space."""
     return FeatureConfig(bin_hours=6.0, top_vitals=30, top_labs=50, top_meds=100,
                          top_infusions=0, top_procedures=0, min_subject_freq=0.05)
-
-
-def build_cohort(
-    data_dir,
-    out_dir,
-    device,
-    feat_cfg: Optional[FeatureConfig] = None,
-    max_patients: Dict[str, int] = None,
-    seq_len: int = 8,
-    stride: int = 4,
-    batch_size: int = 64,
-    seed: int = 42,
-) -> Dict:
-    """MEDS directory → manifest, labels, sequence datasets and loaders.
-
-    Returns a dict with keys: manifest, feat_cfg, id_col, state_dim, n_cont,
-    labels/{train,val,test}, ds/{train,val,test}, and loaders
-    ``train`` (shuffled), ``train_eval`` / ``val`` / ``test`` (unshuffled, so
-    index i lines up with ``ds[split].patient_ids[i]``), plus raw ``dfs``.
-    """
-    data_dir, out_dir = Path(data_dir), Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    feat_cfg = feat_cfg or default_feature_config()
-    max_patients = max_patients or {"train": 10000, "tuning": 3000, "held_out": 30000}
-
-    dfs = {
-        "train": load_meds_fast(data_dir, "train",    max_patients.get("train"),    seed),
-        "val":   load_meds_fast(data_dir, "tuning",   max_patients.get("tuning"),   seed),
-        "test":  load_meds_fast(data_dir, "held_out", max_patients.get("held_out"), seed),
-    }
-    id_col = "patient_id" if "patient_id" in dfs["train"].columns else "subject_id"
-
-    labels = {}
-    for split, df in dfs.items():
-        demo = compute_demographics(df, id_col) if split != "val" else None
-        labels[split] = build_label_table(df, id_col, demo)
-
-    codes_path = data_dir / "extract_code_metadata" / "codes.parquet"
-    codes_df = pd.read_parquet(codes_path) if codes_path.exists() else None
-    manifest = build_feature_manifest(dfs["train"], feat_cfg, codes_df=codes_df)
-    n_cont = manifest.n_continuous
-    state_dim = 4 * n_cont + manifest.demo_dim
-
-    ds, loaders = {}, {}
-    for split, df in dfs.items():
-        trans = get_or_build_transitions(df, manifest, feat_cfg, split, out_dir, id_col)
-        trans = attach_labels_to_transitions(trans, labels[split], id_col)
-        seqs  = build_enriched_sequence_batches(trans, seq_len, stride)
-        ds[split] = LabeledSequenceDataset(seqs, labels[split], id_col)
-
-    loaders["train"]      = DemoAugLoader(DataLoader(ds["train"], batch_size=batch_size, shuffle=True), device)
-    loaders["train_eval"] = DemoAugLoader(DataLoader(ds["train"], batch_size=batch_size, shuffle=False), device)
-    loaders["val"]        = DemoAugLoader(DataLoader(ds["val"],   batch_size=batch_size, shuffle=False), device)
-    loaders["test"]       = DemoAugLoader(DataLoader(ds["test"],  batch_size=batch_size, shuffle=False), device)
-
-    logger.info("state_dim=%d  n_cont=%d  n_actions=%d  seqs train/val/test=%d/%d/%d",
-                state_dim, n_cont, manifest.n_actions, len(ds["train"]), len(ds["val"]), len(ds["test"]))
-    return dict(manifest=manifest, feat_cfg=feat_cfg, id_col=id_col, state_dim=state_dim,
-                n_cont=n_cont, labels=labels, ds=ds, loaders=loaders, dfs=dfs,
-                seq_len=seq_len, stride=stride)

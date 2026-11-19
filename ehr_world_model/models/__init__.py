@@ -1,2 +1,1 @@
-from .velocity import VelocityWorldModel
-from .transformer import TransformerWorldModel, TRANSFORMER_SIZES
+from .world_model import EHRWorldModel
